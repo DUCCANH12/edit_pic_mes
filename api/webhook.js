@@ -352,6 +352,20 @@ function applyLineBolding(text) {
   ).join('\n');
 }
 
+// ─── Giới hạn ký tự của Telegram — KHÁC NHAU giữa text thường và caption ──
+//
+//  - Tin nhắn text thường (editMessageText):    tối đa 4096 ký tự
+//  - Caption của ảnh/video/file (editMessageCaption): tối đa CHỈ 1024 ký tự
+//
+// Bug cũ: code dùng chung 1 mốc 4096 cho cả 2 trường hợp. Với caption dài
+// 1024–4096 ký tự (sau khi bold + wrap code), code tưởng "vẫn ổn" rồi gọi
+// editMessageCaption, nhưng Telegram âm thầm từ chối (chỉ log warning, không
+// ai thấy) → đúng hiện tượng "tin dài thì không sửa, tách ngắn ra thì sửa
+// được".
+
+const TEXT_LIMIT = 4096;
+const CAPTION_LIMIT = 1024;
+
 // ─── Pipeline với fallback khi quá dài ───────────────────────────────────
 //
 //  Level 1 (full):     stripHttps → inlineWrapCodes → applyLineBolding
@@ -359,22 +373,22 @@ function applyLineBolding(text) {
 //  Level 3 (minimal):  stripHttps                              (bỏ cả bold)
 //
 // Lý do cần fallback: mỗi <code>token</code> thêm 13 ký tự,
-// tin dài nhiều mã AFF có thể đẩy tổng vượt giới hạn 4096 của Telegram.
+// tin dài nhiều mã AFF có thể đẩy tổng vượt giới hạn của Telegram.
 
-function buildFinal(text) {
+function buildFinal(text, limit) {
   // Level 1 — full
   let result = applyLineBolding(inlineWrapCodes(stripHttps(text)));
-  if ((result + EDIT_MARKER).length <= 4096) return result;
+  if ((result + EDIT_MARKER).length <= limit) return result;
 
   // Level 2 — bỏ bold, giữ <code> + strip https
   console.warn('Fallback level 2: bỏ bold, giữ <code> + strip https');
   result = inlineWrapCodes(stripHttps(text));
-  if ((result + EDIT_MARKER).length <= 4096) return result;
+  if ((result + EDIT_MARKER).length <= limit) return result;
 
   // Level 3 — chỉ strip https
   console.warn('Fallback level 3: chỉ strip https');
   result = stripHttps(text);
-  if ((result + EDIT_MARKER).length <= 4096) return result;
+  if ((result + EDIT_MARKER).length <= limit) return result;
 
   return null;
 }
@@ -506,13 +520,25 @@ async function handleImageReply(chatId, userId, message) {
 // Hàm này luôn được gọi SAU phần xử lý ảnh (nếu có ảnh trong cùng update).
 async function tryEditMessageInPlace(message) {
   const isMediaMessage = hasMedia(message);
-  const text = message.text || message.caption || '';
-  if (!text) return;
-  if (text.includes(EDIT_MARKER)) return;
+  const rawText = message.text || message.caption || '';
+  if (!rawText) return;
 
-  const wrapped = buildFinal(text);
+  // Bỏ HẾT ký tự EDIT_MARKER trong text trước khi xử lý (kể cả khi nó xuất
+  // hiện không phải do bot vừa sửa, mà do người dùng copy lại 1 tin ĐÃ được
+  // bot sửa trước đó để làm mẫu cho tin mới — ký tự ẩn này vẫn dính theo dù
+  // nội dung hiển thị đã khác). Trước đây code chỉ cần thấy CÓ ký tự này là
+  // bỏ qua toàn bộ tin → đúng nguyên nhân khiến tin "đã đổi nội dung nhưng
+  // vẫn bị bỏ qua, không sửa, mà cũng không gọi API gì cả" (chạy ~27ms, 0
+  // outgoing request). Giờ thay vì bỏ qua hẳn, ta lọc sạch ký tự ẩn rồi so
+  // sánh nội dung THẬT — vẫn giữ nguyên tác dụng chống tự-sửa-lặp-vô-hạn
+  // (nếu nội dung sau khi lọc không đổi gì thêm thì vẫn return ở dòng dưới).
+  const text = rawText.split(EDIT_MARKER).join('');
+
+  // Caption (ảnh/video/file) giới hạn 1024 ký tự, text thường giới hạn 4096
+  const limit = isMediaMessage ? CAPTION_LIMIT : TEXT_LIMIT;
+  const wrapped = buildFinal(text, limit);
   if (wrapped === null) {
-    console.warn('Tin quá dài kể cả sau fallback, bỏ qua:', text.length);
+    console.warn(`Tin quá dài kể cả sau fallback (limit=${limit}), bỏ qua:`, text.length);
     return;
   }
   if (wrapped === text) return; // Không có gì thay đổi
